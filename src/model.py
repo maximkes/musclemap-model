@@ -270,48 +270,48 @@ class MuscleMAPModel(nn.Module):
         if self._svd_done:
             return
 
-    def _get_lm_weight() -> Tensor | None:
-        # Unwrap DDP on backbone if needed
-        backbone = self.backbone.module if hasattr(self.backbone, "module") else self.backbone
+        def _get_lm_weight() -> Tensor | None:
+            # Unwrap DDP on backbone if needed
+            backbone = self.backbone.module if hasattr(self.backbone, "module") else self.backbone
 
-        # Preferred: backbone.lm_head.weight (T5ForConditionalGeneration style)
-        if hasattr(backbone, "lm_head") and hasattr(backbone.lm_head, "weight"):
-            w = backbone.lm_head.weight
-            if isinstance(w, Tensor):
-                return w
+            # Preferred: backbone.lm_head.weight (T5ForConditionalGeneration style)
+            if hasattr(backbone, "lm_head") and hasattr(backbone.lm_head, "weight"):
+                w = backbone.lm_head.weight
+                if isinstance(w, Tensor):
+                    return w
 
-        # MotionGPT (vendor) nesting: backbone.lm.language_model.lm_head.weight
-        lm = getattr(backbone, "lm", None)
-        if lm is not None:
-            language_model = getattr(lm, "language_model", None)
-            if language_model is not None:
-                if hasattr(language_model, "lm_head") and hasattr(language_model.lm_head, "weight"):
-                    w = language_model.lm_head.weight
-                    if isinstance(w, Tensor):
-                        return w
-                if hasattr(language_model, "get_output_embeddings"):
-                    emb = language_model.get_output_embeddings()
-                    if emb is not None and hasattr(emb, "weight") and isinstance(emb.weight, Tensor):
-                        return emb.weight
+            # MotionGPT (vendor) nesting: backbone.lm.language_model.lm_head.weight
+            lm = getattr(backbone, "lm", None)
+            if lm is not None:
+                language_model = getattr(lm, "language_model", None)
+                if language_model is not None:
+                    if hasattr(language_model, "lm_head") and hasattr(language_model.lm_head, "weight"):
+                        w = language_model.lm_head.weight
+                        if isinstance(w, Tensor):
+                            return w
+                    if hasattr(language_model, "get_output_embeddings"):
+                        emb = language_model.get_output_embeddings()
+                        if emb is not None and hasattr(emb, "weight") and isinstance(emb.weight, Tensor):
+                            return emb.weight
 
-        return None
+            return None
 
-    # Unwrap DDP on activation_head if needed
-    act_head = self.activation_head.module if hasattr(self.activation_head, "module") else self.activation_head
+        # Unwrap DDP on activation_head if needed
+        act_head = self.activation_head.module if hasattr(self.activation_head, "module") else self.activation_head
 
-    W_lm_param = _get_lm_weight()
-    if W_lm_param is None:
-        logger.warning("SVD warm-start skipped: could not locate backbone LM head weight.")
+        W_lm_param = _get_lm_weight()
+        if W_lm_param is None:
+            logger.warning("SVD warm-start skipped: could not locate backbone LM head weight.")
+            self._svd_done = True
+            return
+
+        W_lm = W_lm_param.data  # [vocab_size, hidden]
+        if W_lm.ndim != 2 or W_lm.shape[1] != act_head.input_proj.in_features:
+            raise ValueError(f"Unexpected lm_head weight shape: {tuple(W_lm.shape)}")
+        _, _, Vt = torch.linalg.svd(W_lm, full_matrices=False)
+        with torch.no_grad():
+            act_head.input_proj.weight.copy_(Vt[: act_head.input_proj.out_features, :])
         self._svd_done = True
-        return
-
-    W_lm = W_lm_param.data  # [vocab_size, hidden]
-    if W_lm.ndim != 2 or W_lm.shape[1] != act_head.input_proj.in_features:
-        raise ValueError(f"Unexpected lm_head weight shape: {tuple(W_lm.shape)}")
-    _, _, Vt = torch.linalg.svd(W_lm, full_matrices=False)
-    with torch.no_grad():
-        act_head.input_proj.weight.copy_(Vt[: act_head.input_proj.out_features, :])
-    self._svd_done = True
     def forward(self, text_tokens: Any, motion_tokens: Any | None = None) -> tuple[Tensor, Tensor, Any]:
         """Run model forward.
 
@@ -326,11 +326,14 @@ class MuscleMAPModel(nn.Module):
         self._cached_encoder_hidden = None
         self._cached_decoder_hidden = None
 
-        if motion_tokens is None and hasattr(self.backbone, "generate"):
-            motion_output = self.backbone.generate(text_tokens)  # type: ignore[call-arg]
+        if motion_tokens is None:
+            if hasattr(self.backbone, "generate"):
+                motion_output = self.backbone.generate(text_tokens)
+            else:
+                motion_output = self.backbone(text_tokens)   # no motion_tokens kwarg
         else:
-            motion_output = self.backbone(text_tokens, motion_tokens=motion_tokens)  # type: ignore[call-arg]
-
+            motion_output = self.backbone(text_tokens, motion_tokens=motion_tokens)
+            
         encoder_hidden = self._cached_encoder_hidden
         decoder_hidden = self._cached_decoder_hidden
 
