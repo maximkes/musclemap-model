@@ -270,135 +270,135 @@ class MuscleMAPModel(nn.Module):
         if self._svd_done:
             return
 
-        def _get_lm_weight() -> Tensor | None:
-            # Unwrap DDP on backbone if needed
-            backbone = self.backbone.module if hasattr(self.backbone, "module") else self.backbone
+    def _get_lm_weight() -> Tensor | None:
+        # Unwrap DDP on backbone if needed
+        backbone = self.backbone.module if hasattr(self.backbone, "module") else self.backbone
 
-            # Preferred: backbone.lm_head.weight (T5ForConditionalGeneration style)
-            if hasattr(backbone, "lm_head") and hasattr(backbone.lm_head, "weight"):
-                w = backbone.lm_head.weight
-                if isinstance(w, Tensor):
-                    return w
+        # Preferred: backbone.lm_head.weight (T5ForConditionalGeneration style)
+        if hasattr(backbone, "lm_head") and hasattr(backbone.lm_head, "weight"):
+            w = backbone.lm_head.weight
+            if isinstance(w, Tensor):
+                return w
 
-            # MotionGPT (vendor) nesting: backbone.lm.language_model.lm_head.weight
-            lm = getattr(backbone, "lm", None)
-            if lm is not None:
-                language_model = getattr(lm, "language_model", None)
-                if language_model is not None:
-                    if hasattr(language_model, "lm_head") and hasattr(language_model.lm_head, "weight"):
-                        w = language_model.lm_head.weight
-                        if isinstance(w, Tensor):
-                            return w
-                    if hasattr(language_model, "get_output_embeddings"):
-                        emb = language_model.get_output_embeddings()
-                        if emb is not None and hasattr(emb, "weight") and isinstance(emb.weight, Tensor):
-                            return emb.weight
+        # MotionGPT (vendor) nesting: backbone.lm.language_model.lm_head.weight
+        lm = getattr(backbone, "lm", None)
+        if lm is not None:
+            language_model = getattr(lm, "language_model", None)
+            if language_model is not None:
+                if hasattr(language_model, "lm_head") and hasattr(language_model.lm_head, "weight"):
+                    w = language_model.lm_head.weight
+                    if isinstance(w, Tensor):
+                        return w
+                if hasattr(language_model, "get_output_embeddings"):
+                    emb = language_model.get_output_embeddings()
+                    if emb is not None and hasattr(emb, "weight") and isinstance(emb.weight, Tensor):
+                        return emb.weight
 
-            return None
+        return None
 
-        # Unwrap DDP on activation_head if needed
-        act_head = self.activation_head.module if hasattr(self.activation_head, "module") else self.activation_head
+    # Unwrap DDP on activation_head if needed
+    act_head = self.activation_head.module if hasattr(self.activation_head, "module") else self.activation_head
 
-        W_lm_param = _get_lm_weight()
-        if W_lm_param is None:
-            logger.warning("SVD warm-start skipped: could not locate backbone LM head weight.")
-            self._svd_done = True
-            return
-
-        W_lm = W_lm_param.data  # [vocab_size, hidden]
-        if W_lm.ndim != 2 or W_lm.shape[1] != act_head.input_proj.in_features:
-            raise ValueError(f"Unexpected lm_head weight shape: {tuple(W_lm.shape)}")
-        _, _, Vt = torch.linalg.svd(W_lm, full_matrices=False)
-        with torch.no_grad():
-            act_head.input_proj.weight.copy_(Vt[: act_head.input_proj.out_features, :])
+    W_lm_param = _get_lm_weight()
+    if W_lm_param is None:
+        logger.warning("SVD warm-start skipped: could not locate backbone LM head weight.")
         self._svd_done = True
-        def forward(self, text_tokens: Any, motion_tokens: Any | None = None) -> tuple[Tensor, Tensor, Any]:
-            """Run model forward.
+        return
 
-            Returns:
-                logits: [B, T_frame, 80]
-                pred_log_T: [B, 1]
-                motion_output: vendor-specific
-            """
+    W_lm = W_lm_param.data  # [vocab_size, hidden]
+    if W_lm.ndim != 2 or W_lm.shape[1] != act_head.input_proj.in_features:
+        raise ValueError(f"Unexpected lm_head weight shape: {tuple(W_lm.shape)}")
+    _, _, Vt = torch.linalg.svd(W_lm, full_matrices=False)
+    with torch.no_grad():
+        act_head.input_proj.weight.copy_(Vt[: act_head.input_proj.out_features, :])
+    self._svd_done = True
+    def forward(self, text_tokens: Any, motion_tokens: Any | None = None) -> tuple[Tensor, Tensor, Any]:
+        """Run model forward.
 
-            self._maybe_svd_warm_start()
+        Returns:
+            logits: [B, T_frame, 80]
+            pred_log_T: [B, 1]
+            motion_output: vendor-specific
+        """
 
-            self._cached_encoder_hidden = None
-            self._cached_decoder_hidden = None
+        self._maybe_svd_warm_start()
 
-            if motion_tokens is None and hasattr(self.backbone, "generate"):
-                motion_output = self.backbone.generate(text_tokens)  # type: ignore[call-arg]
-            else:
-                motion_output = self.backbone(text_tokens, motion_tokens=motion_tokens)  # type: ignore[call-arg]
+        self._cached_encoder_hidden = None
+        self._cached_decoder_hidden = None
 
-            encoder_hidden = self._cached_encoder_hidden
-            decoder_hidden = self._cached_decoder_hidden
+        if motion_tokens is None and hasattr(self.backbone, "generate"):
+            motion_output = self.backbone.generate(text_tokens)  # type: ignore[call-arg]
+        else:
+            motion_output = self.backbone(text_tokens, motion_tokens=motion_tokens)  # type: ignore[call-arg]
 
-            # Allow mocked backbones to return hidden states directly.
-            if encoder_hidden is None and isinstance(motion_output, dict) and "encoder_hidden" in motion_output:
-                encoder_hidden = motion_output["encoder_hidden"]
-            if decoder_hidden is None and isinstance(motion_output, dict) and "decoder_hidden" in motion_output:
-                decoder_hidden = motion_output["decoder_hidden"]
+        encoder_hidden = self._cached_encoder_hidden
+        decoder_hidden = self._cached_decoder_hidden
 
-            if encoder_hidden is None or decoder_hidden is None:
-                raise RuntimeError("Missing encoder/decoder hidden states (hooks not triggered?)")
+        # Allow mocked backbones to return hidden states directly.
+        if encoder_hidden is None and isinstance(motion_output, dict) and "encoder_hidden" in motion_output:
+            encoder_hidden = motion_output["encoder_hidden"]
+        if decoder_hidden is None and isinstance(motion_output, dict) and "decoder_hidden" in motion_output:
+            decoder_hidden = motion_output["decoder_hidden"]
 
-            pred_log_T = self.length_predictor(encoder_hidden)  # [B, 1]
+        if encoder_hidden is None or decoder_hidden is None:
+            raise RuntimeError("Missing encoder/decoder hidden states (hooks not triggered?)")
 
-            # Pick one common T_frame for the whole batch.
-            if self.config is not None:
-                lp_cfg = self.config.get("model", {}).get("length_predictor", {})
-                min_T = int(lp_cfg.get("min_T", 30))
-                max_T = int(lp_cfg.get("max_T", 256))
-            else:
-                min_T, max_T = 30, 256
-            pred_T = torch.exp(pred_log_T).round().clamp(min=float(min_T), max=float(max_T)).to(dtype=torch.int64)
-            T_frame = int(pred_T.max().item())
+        pred_log_T = self.length_predictor(encoder_hidden)  # [B, 1]
 
-            logits = self.activation_head(decoder_hidden, T_frame=T_frame)  # [B, T_frame, 80]
-            return logits, pred_log_T, motion_output
+        # Pick one common T_frame for the whole batch.
+        if self.config is not None:
+            lp_cfg = self.config.get("model", {}).get("length_predictor", {})
+            min_T = int(lp_cfg.get("min_T", 30))
+            max_T = int(lp_cfg.get("max_T", 256))
+        else:
+            min_T, max_T = 30, 256
+        pred_T = torch.exp(pred_log_T).round().clamp(min=float(min_T), max=float(max_T)).to(dtype=torch.int64)
+        T_frame = int(pred_T.max().item())
 
-        def parameters_to_train(self):
-            """Return only the trainable parameters (activation_head + LoRA adapters).
-            Backbone weights are frozen except for LoRA layers injected by peft.
-            """
-            params = list(self.activation_head.parameters())
-            # Include any backbone params that have requires_grad=True (i.e. LoRA adapters)
-            params += [p for p in self.backbone.parameters() if p.requires_grad]
-            return params
-        
-        def apply_lora(self, config: dict[str, Any]) -> None:
-            """Apply LoRA adapters to the T5 decoder (stage 2)."""
+        logits = self.activation_head(decoder_hidden, T_frame=T_frame)  # [B, T_frame, 80]
+        return logits, pred_log_T, motion_output
 
-            try:
-                from peft import LoraConfig, get_peft_model  # type: ignore[import-not-found]
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError("peft is required for apply_lora") from e
+    def parameters_to_train(self):
+        """Return only the trainable parameters (activation_head + LoRA adapters).
+        Backbone weights are frozen except for LoRA layers injected by peft.
+        """
+        params = list(self.activation_head.parameters())
+        # Include any backbone params that have requires_grad=True (i.e. LoRA adapters)
+        params += [p for p in self.backbone.parameters() if p.requires_grad]
+        return params
+    
+    def apply_lora(self, config: dict[str, Any]) -> None:
+        """Apply LoRA adapters to the T5 decoder (stage 2)."""
 
-            lora_cfg = config.get("training", {})
-            r = int(lora_cfg.get("lora_r", 8))
-            alpha = int(lora_cfg.get("lora_alpha", 16))
-            dropout = float(lora_cfg.get("lora_dropout", 0.05))
-            target_modules = list(lora_cfg.get("lora_target_modules", ["q", "v"]))
+        try:
+            from peft import LoraConfig, get_peft_model  # type: ignore[import-not-found]
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError("peft is required for apply_lora") from e
 
-            decoder: nn.Module | None = None
-            if hasattr(self.backbone, "t5") and hasattr(self.backbone.t5, "decoder"):
-                decoder = self.backbone.t5.decoder
-            elif hasattr(self.backbone, "decoder"):
-                decoder = getattr(self.backbone, "decoder")
+        lora_cfg = config.get("training", {})
+        r = int(lora_cfg.get("lora_r", 8))
+        alpha = int(lora_cfg.get("lora_alpha", 16))
+        dropout = float(lora_cfg.get("lora_dropout", 0.05))
+        target_modules = list(lora_cfg.get("lora_target_modules", ["q", "v"]))
 
-            if decoder is None or not isinstance(decoder, nn.Module):
-                raise AttributeError("Could not locate T5 decoder module on backbone")
+        decoder: nn.Module | None = None
+        if hasattr(self.backbone, "t5") and hasattr(self.backbone.t5, "decoder"):
+            decoder = self.backbone.t5.decoder
+        elif hasattr(self.backbone, "decoder"):
+            decoder = getattr(self.backbone, "decoder")
 
-            peft_config = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules)
-            wrapped = get_peft_model(decoder, peft_config)
+        if decoder is None or not isinstance(decoder, nn.Module):
+            raise AttributeError("Could not locate T5 decoder module on backbone")
 
-            # Ensure LoRA params are trainable.
-            for p in wrapped.parameters():
-                if p.requires_grad:
-                    continue
-            if hasattr(self.backbone, "t5") and hasattr(self.backbone.t5, "decoder"):
-                self.backbone.t5.decoder = wrapped
-            else:
-                setattr(self.backbone, "decoder", wrapped)
+        peft_config = LoraConfig(r=r, lora_alpha=alpha, lora_dropout=dropout, target_modules=target_modules)
+        wrapped = get_peft_model(decoder, peft_config)
+
+        # Ensure LoRA params are trainable.
+        for p in wrapped.parameters():
+            if p.requires_grad:
+                continue
+        if hasattr(self.backbone, "t5") and hasattr(self.backbone.t5, "decoder"):
+            self.backbone.t5.decoder = wrapped
+        else:
+            setattr(self.backbone, "decoder", wrapped)
 
