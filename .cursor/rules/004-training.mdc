@@ -1,0 +1,48 @@
+---
+description: Training loop rules — apply when editing scripts/train.py and src/trainer.py
+globs: ["scripts/train.py", "src/trainer.py"]
+alwaysApply: false
+---
+
+# Training Rules
+
+## Loss
+- Primary: nn.BCEWithLogitsLoss(reduction='mean') on raw logits vs float32 targets in [0,1]
+- Smoothness: (Sigmoid(logits)[:,1:] - Sigmoid(logits)[:,:-1]).abs().mean()
+- Length: nn.SmoothL1Loss()(log_pred_T, log_true_T)
+- Total: bce_w * bce + smooth_w * smooth + length_w * length
+
+## Data split (CRITICAL — no leakage)
+- Split by CANONICAL ACTION NAME, not by clip
+- canonical(id) = id with _clipN and trailing _N stripped, lowercased, underscores to spaces
+- Group all clips of same canonical name -> assign entire group to one split
+- Shuffle groups with seed=42, split 90/5/5
+- Filter T < min_T BEFORE splitting
+
+## Two-stage training
+- Stage 1: head only, LR=3e-4, AdamW, weight_decay=1e-4
+- Stage 2 (epoch >= unfreeze_after_epoch): apply LoRA, add lora param group at lora_lr=5e-6
+- Save checkpoint BEFORE applying LoRA
+
+## Teacher forcing (training only)
+- Encode smplx_322 through VQ-VAE encoder -> motion tokens
+- Use as decoder input instead of autoregressive generation
+- Switch to autoregressive at inference
+
+## Mixed precision and optimization
+- torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16) — no GradScaler for bf16
+- clip_grad_norm_(head.parameters(), 1.0) every step
+- zero_grad(set_to_none=True) every step
+- Linear warmup + cosine decay
+
+## Checkpointing
+- Save: model state_dict, optimizer, epoch, best_val_loss
+- Atomic: write .ckpt.tmp then rename to .ckpt
+- Auto-resume: if checkpoint_dir/latest.ckpt exists at startup, load and continue
+- Keep last N checkpoints (config.logging.keep_last_n_checkpoints)
+
+## W&B logging
+- Scalars every log_every_n_steps: train_loss, bce_loss, smooth_loss, length_loss, lr
+- Full metrics every eval_every_n_epochs: MPJAE, per-muscle R2, bias, smoothness, length_mae
+- Activation histograms every 10 epochs (check for sigmoid saturation)
+- Sample table every 10 epochs: 8 val sequences with text + pred_T + true_T

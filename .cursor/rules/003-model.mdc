@@ -1,0 +1,43 @@
+---
+description: Model architecture — apply when editing src/head.py and src/model.py
+globs: ["src/head.py", "src/model.py"]
+alwaysApply: false
+---
+
+# Model Architecture
+
+## MotionGPT backbone (frozen)
+- Freeze ALL parameters after loading: for p in backbone.parameters(): p.requires_grad = False
+- Extract T5 decoder hidden states via register_forward_hook on last T5 decoder layer
+- Extract T5 encoder output via hook (for LengthPredictor)
+- LM head stays frozen and active — activation head runs in PARALLEL
+
+## LengthPredictor
+- Input: encoder_hidden [B, T_enc, 768] -> GlobalAvgPool -> [B, 768]
+- Linear(768->128) -> GELU -> Dropout(0.1) -> Linear(128->1)
+- Output: log(T_frame) as float [B, 1]
+- Inference: T_frame = int(exp(pred).round().clamp(min_T, max_T))
+- Init: Xavier uniform
+
+## ActivationHead (cross-attention upsampler — NOT Conv1d)
+- Keys/Values: T5 decoder hidden [B, T_tok, 768] projected via Linear(768->256)
+- Queries: learned position embeddings [1, T_frame, 256] (T_frame from LengthPredictor)
+- nn.MultiheadAttention(embed_dim=256, num_heads=4, batch_first=True)
+- 3x nn.TransformerEncoderLayer(d_model=256, nhead=4, batch_first=True, dropout=0.1)
+- Linear(256->80, bias=False) -> raw logits [B, T_frame, 80]
+- Sigmoid applied OUTSIDE: BCEWithLogitsLoss during training; Sigmoid().clamp(0,1) at inference
+
+## SVD warm-start (in model.py after loading backbone)
+    W_lm = backbone.lm_head.weight.data  # [vocab_size, 768]
+    _, _, Vt = torch.linalg.svd(W_lm, full_matrices=False)
+    head.input_proj.weight.data.copy_(Vt[:256, :])  # [256, 768]
+
+## LoRA (Stage 2 only)
+- peft.LoraConfig(r=8, lora_alpha=16, lora_dropout=0.05, target_modules=["q", "v"])
+- Apply to T5 decoder only
+- Save with peft_model.save_pretrained("checkpoints/lora/")
+
+## DDP rule (CRITICAL)
+- DistributedDataParallel(activation_head, device_ids=[local_rank])
+- MotionGPT backbone NOT wrapped in DDP
+- Inference inside training loop: head_unwrapped = head.module if hasattr(head, 'module') else head

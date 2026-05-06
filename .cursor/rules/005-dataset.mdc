@@ -1,0 +1,31 @@
+---
+description: Dataset rules — apply when editing src/dataset.py
+globs: ["src/dataset.py"]
+alwaysApply: false
+---
+
+# Dataset Rules
+
+## MuscleActivationDataset
+- Scan dataset_root for sequence dirs containing activations.npy + smplx_322.npy + semantic_label.txt
+- Load muscle_names.json; assert len == N_muscles
+- Filter sequences with T < min_T (default 30)
+- Window sequences longer than max_T with stride = max_T // 2
+- Return dict: {text: str, motion: Tensor[T,322], acts: Tensor[T,80], mask: BoolTensor[T], true_T: int}
+
+## Label cleaning
+    import re
+    def clean_label(sample_id: str) -> str:
+        s = re.sub(r'_clip\d+$', '', sample_id, flags=re.IGNORECASE)
+        s = re.sub(r'_\d+$', '', s)
+        return s.replace('_', ' ').strip().lower()
+
+- Prefer semantic_label.txt IF not a numeric blob (>50% tokens parseable as float -> numeric)
+- Fall back to clean_label(sample_id) for numeric blobs
+
+## Version selector
+- config.data.dataset_version (e.g. "v1"): load from dataset_root/v1/ if set
+- Fall back to dataset_root/ with warning if versioned path missing
+
+## Windowing note (for README)
+- Same text label used for all windows of same sequence — intentional, not leakage

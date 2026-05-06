@@ -1,0 +1,19 @@
+---
+description: Metrics rules — apply when editing src/metrics.py and scripts/evaluate.py
+globs: ["src/metrics.py", "scripts/evaluate.py"]
+alwaysApply: false
+---
+
+# Metrics (all required)
+
+1. MPJAE: |pred - true|.mean() over all muscles and frames
+2. Per-muscle R2: sklearn r2_score for each of 80 muscles (report top-10, bottom-10)
+3. Per-muscle mean bias: pred.mean(0) - true.mean(0) (positive=over-activates)
+4. Per-muscle Pearson correlation: scipy.stats.pearsonr per muscle
+5. Temporal smoothness: |a[t+1]-a[t]|.mean() on predictions
+6. Length MAE: |predicted_T - true_T|.mean() in frames
+
+## Output
+- Save all to results/{split}_metrics.json
+- Print sorted per-muscle R2 table to stdout
+- Log scalars + per-muscle R2 bar chart to W&B if run active

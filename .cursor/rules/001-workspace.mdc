@@ -1,0 +1,40 @@
+---
+description: Root workspace definition — always apply to every conversation
+globs: ["**/*"]
+alwaysApply: true
+---
+
+# musclemap-model — Project Overview
+
+## What this project does
+Takes a **text description of a motion** and outputs **muscle activations** — float32 [T, 80], values in [0,1].
+Wraps a frozen MotionGPT backbone (T5 + VQ-VAE) with a trainable parallel activation head.
+
+## Key architectural facts
+- MotionGPT backbone lives at `vendor/MotionGPT/` — NEVER modify files under vendor/
+- Trainable: ActivationHead (src/head.py) + LoRA adapters on T5 decoder (Stage 2 only)
+- Loss: BCEWithLogitsLoss (primary) + temporal smoothness. NOT MSE.
+- DDP wraps ONLY ActivationHead, NOT the full MotionGPT model
+- Output: raw logits inside training; Sigmoid applied only at inference
+
+## Dataset (Project 1 output)
+- Root: config/train.yaml -> data.dataset_root
+- Per sample: activations.npy [T,80] float32, smplx_322.npy [T,322] float32, semantic_label.txt
+- Shared: muscle_names.json — 80 muscles, Rajagopal2016
+- fps=30, median T≈172, max T=483, ~12000 sequences
+
+## Commands
+- Setup:   bash scripts/setup.sh
+- Train:   torchrun --nproc_per_node=2 scripts/train.py --config config/train.yaml
+- Eval:    python scripts/evaluate.py --config config/train.yaml --split test
+- App:     python app/app.py
+- CLI:     python app/demo.py --text "a person walks" --output-npy out.npy
+- Tests:   pytest -q
+- Lint:    ruff check src/ scripts/ app/ tests/
+
+## Constraints
+- Python 3.10, conda env musclemap-model
+- PyTorch 2.x, bf16 on 2x NVIDIA A30 24GB
+- No opensim imports — reads .npy files from Project 1 only
+- matplotlib.use('Agg') BEFORE any plt import (headless server)
+- Cross-platform paths (no hardcoded /home/ or C:\\)

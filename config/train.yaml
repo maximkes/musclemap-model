@@ -1,0 +1,89 @@
+data:
+  dataset_root: ../musclemap-data/data/motionx_activations
+  dataset_version: ''
+  max_T: 256
+  min_T: 30
+  muscle_names_json: muscle_names.json
+  split_seed: 42
+  test_split: 0.05
+  train_split: 0.9
+  val_split: 0.05
+app:
+  gradio_port: 7860
+  gradio_share: false
+  p1_src_path: ../musclemap-data/src
+hardware:
+  find_unused_parameters: false
+  num_gpus: 2
+  num_workers: 8
+  pin_memory: true
+logging:
+  checkpoint_dir: checkpoints/
+  eval_every_n_epochs: 5
+  keep_last_n_checkpoints: 3
+  log_every_n_steps: 10
+  wandb_project: musclemap
+  wandb_run_name: baseline_frozen_head
+model:
+  head:
+    dropout: 0.1
+    n_heads: 4
+    n_muscles: 80
+    n_transformer_layers: 3
+    proj_dim: 256
+    t5_hidden_dim: 768
+  length_predictor:
+    hidden_dim: 128
+    max_T: 256
+    min_T: 30
+  motiongpt_ckpt: checkpoints/MotionGPT-base
+  motiongpt_commit: b82ce31a0021dde922d58a783889a12452db7db2
+  motiongpt_dir: vendor/MotionGPT
+training:
+  accumulation_steps: 2
+  batch_size: 16
+  epochs: 100
+  gradient_clip_norm: 1.0
+  learning_rate: 0.0003
+  lora_alpha: 16
+  lora_dropout: 0.05
+  lora_lr: 5.0e-06
+  lora_r: 8
+  lora_target_modules:
+  - q
+  - v
+  loss:
+    bce_weight: 1.0
+    length_weight: 0.1
+    smoothness_weight: 0.1
+  mixed_precision: bf16
+  unfreeze_after_epoch: 20
+  warmup_steps: 500
+  weight_decay: 0.0001
+DATASET:
+  target: mGPT.data.HumanML3D.HumanML3DDataModule
+  CODE_PATH: TOKENS
+METRIC:
+  TYPE:
+  - TM2TMetrics
+  - PredMetrics
+  TM2T:
+    t2m_moveencoder:
+      target: mGPT.archs.tm2t_evaluator.MovementConvEncoder
+      params:
+        input_size: 263
+        hidden_size: 512
+        output_size: 512
+    t2m_textencoder:
+      target: mGPT.archs.tm2t_evaluator.TextEncoderBiGRUCo
+      params:
+        word_size: 300
+        pos_size: 15
+        hidden_size: 512
+        output_size: 512
+    t2m_motionencoder:
+      target: mGPT.archs.tm2t_evaluator.MotionEncoderBiGRUCo
+      params:
+        input_size: 512
+        hidden_size: 1024
+        output_size: 512

@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+environment.lock.yml
+vendor/
+checkpoints/
+results/
+*.ckpt
+*.ckpt.tmp
+wandb/
+.tmp/
+*.tmp
+.DS_Store
+vendor/

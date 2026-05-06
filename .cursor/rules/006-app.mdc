@@ -1,0 +1,26 @@
+---
+description: App rules — apply when editing app/app.py and app/demo.py
+globs: ["app/app.py", "app/demo.py"]
+alwaysApply: false
+---
+
+# App Rules
+
+## app/app.py (Gradio)
+- Copy vendor/MotionGPT/app.py to app/app.py, then adapt — do NOT rewrite from scratch
+- FIRST LINE after imports: import matplotlib; matplotlib.use('Agg')
+- Add gr.File output: "Download Activations (.npy)"
+- Output filename: activations_{md5(prompt+timestamp)[:8]}.npy
+- File format: float32 [T, 80] after Sigmoid — identical to P1 format
+- Add activation heatmap as gr.Image (top-20 muscles, viridis, headless-safe PNG bytes)
+- Expose api_name="predict" on inference function
+- Load P1 visualization: sys.path.insert(0, config.app.p1_src_path) at startup
+  - If import fails: log warning, skip visualization gracefully
+
+## app/demo.py (CLI)
+- Copy vendor/MotionGPT/demo.py, add:
+  - --output-npy PATH: saves activations.npy
+  - --show-activations: plots top-10 muscles via P1 visualization
+- Default: identical to upstream demo.py
+
+## Never call plt.show() — use fig.savefig(buf, format='png') with io.BytesIO()

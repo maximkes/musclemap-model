@@ -1,0 +1,32 @@
+---
+description: Code style — apply to all Python files
+globs: ["**/*.py"]
+alwaysApply: true
+---
+
+# Code Style
+
+- from __future__ import annotations at top of every src/ module
+- Type hints required on all function signatures
+- Docstrings required on all public functions and classes (one-line minimum)
+- Use pathlib.Path, never os.path
+- No bare except: — always except SomeError as e:
+- No print() in src/ — use logging.getLogger(__name__)
+- Constants in UPPER_SNAKE_CASE at module level
+- Never hardcode 80 (n_muscles) or 322 (smplx_dim) — read from config or muscle_names.json
+- Document tensor shapes in comments: # [B, T, N_muscles]
+- Use einops.rearrange for non-trivial reshaping
+- Atomic writes: write to .tmp then Path.rename() for checkpoints
+- Text files: always encoding="utf-8"
+
+## Testing
+- Every public function in src/ has at least one unit test
+- Tests must NOT require GPU, network, or real dataset
+- Use synthetic tensors: batch=2, T=16, N=80
+- Mock heavy imports with unittest.mock.patch
+
+## What NOT to do
+- Do NOT modify anything under vendor/
+- Do NOT call model.generate() inside DDP-wrapped module
+- Do NOT use torch.nn.DataParallel — DDP only
+- Do NOT call plt.show() — use fig.savefig(buf) with BytesIO
