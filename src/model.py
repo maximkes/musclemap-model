@@ -328,12 +328,12 @@ class MuscleMAPModel(nn.Module):
 
         if motion_tokens is None:
             if hasattr(self.backbone, "generate"):
-                motion_output = self.backbone.generate(text_tokens)
+                motion_output = self.backbone.generate({"text": text_tokens})
             else:
-                motion_output = self.backbone(text_tokens)   # no motion_tokens kwarg
+                motion_output = self.backbone({"text": text_tokens})
         else:
-            motion_output = self.backbone(text_tokens, motion_tokens=motion_tokens)
-            
+            motion_output = self.backbone({"text": text_tokens, "motion_tokens": motion_tokens})
+
         encoder_hidden = self._cached_encoder_hidden
         decoder_hidden = self._cached_decoder_hidden
 
