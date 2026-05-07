@@ -325,7 +325,12 @@ class MuscleMAPModel(nn.Module):
         self._cached_decoder_hidden = None
 
         # Determine batch size for fallback lengths
-        B = text_tokens["input_ids"].shape[0] if isinstance(text_tokens, dict) else text_tokens.shape[0]
+        if isinstance(text_tokens, dict):
+            B = text_tokens["input_ids"].shape[0]
+        elif isinstance(text_tokens, list):
+            B = len(text_tokens)
+        else:
+            B = text_tokens.shape[0]
         if lengths is None:
             lengths = [196] * B  # HumanML3D max as safe fallback
 
