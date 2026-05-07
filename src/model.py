@@ -312,28 +312,34 @@ class MuscleMAPModel(nn.Module):
         with torch.no_grad():
             act_head.input_proj.weight.copy_(Vt[: act_head.input_proj.out_features, :])
         self._svd_done = True
-    def forward(self, text_tokens: Any, motion_tokens: Any | None = None) -> tuple[Tensor, Tensor, Any]:
-        """Run model forward.
 
-        Returns:
-            logits: [B, T_frame, 80]
-            pred_log_T: [B, 1]
-            motion_output: vendor-specific
-        """
+    def forward(
+        self,
+        text_tokens: Any,
+        motion_tokens: Any | None = None,
+        lengths: list[int] | None = None,
+    ) -> tuple[Tensor, Tensor, Any]:
 
         self._maybe_svd_warm_start()
-
         self._cached_encoder_hidden = None
         self._cached_decoder_hidden = None
 
-        if motion_tokens is None:
-            if hasattr(self.backbone, "generate"):
-                motion_output = self.backbone.generate({"text": text_tokens})
-            else:
-                motion_output = self.backbone({"text": text_tokens})
-        else:
-            motion_output = self.backbone({"text": text_tokens, "motion_tokens": motion_tokens})
+        # Determine batch size for fallback lengths
+        B = text_tokens["input_ids"].shape[0] if isinstance(text_tokens, dict) else text_tokens.shape[0]
+        if lengths is None:
+            lengths = [196] * B  # HumanML3D max as safe fallback
 
+        if motion_tokens is None:
+            batch = {"text": text_tokens, "length": lengths}
+            motion_output = (
+                self.backbone.generate(batch)
+                if hasattr(self.backbone, "generate")
+                else self.backbone(batch)
+            )
+        else:
+            motion_output = self.backbone(
+                {"text": text_tokens, "motion_tokens": motion_tokens, "length": lengths}
+            )
         encoder_hidden = self._cached_encoder_hidden
         decoder_hidden = self._cached_decoder_hidden
 

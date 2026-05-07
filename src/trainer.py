@@ -108,23 +108,31 @@ class Trainer:
         self.model.train()
         accum_steps = int(self.config["training"].get("accumulation_steps", 1))
         clip_norm = float(self.config["training"].get("gradient_clip_norm", 1.0))
+        mp = str(self.config["training"].get("mixed_precision", "")).lower()
+        use_autocast = (mp == "bf16") and (self.device.type == "cuda")
 
         total_loss = 0.0
         n_steps = 0
 
         self.optimizer.zero_grad(set_to_none=True)
         for step, batch in enumerate(self.train_loader):
-            acts = batch["acts"].to(self.device)  # [B, T, 80]
-            mask = batch["mask"].to(self.device)  # [B, T]
+            acts = batch["acts"].to(self.device)           # [B, T, 80]
+            mask = batch["mask"].to(self.device)           # [B, T]
             true_T = torch.as_tensor(batch["true_T"], device=self.device)
             text_tokens = batch.get("text_tokens", batch["text"])
             motion_tokens = batch.get("motion_tokens", None)
 
-            mp = str(self.config["training"].get("mixed_precision", "")).lower()
-            use_autocast = (mp == "bf16") and (self.device.type == "cuda")
+            # MotionGPT backbone requires a "length" key in the batch dict.
+            # Use true_T if available (actual per-sample lengths), otherwise
+            # fall back to acts sequence length as a safe default.
+            lengths = batch.get("lengths", true_T.tolist() if true_T.ndim > 0 else [acts.shape[1]] * acts.shape[0])
 
             with _autocast_ctx(self.device.type, enabled=use_autocast):
-                logits, pred_log_T, _ = self.model(text_tokens, motion_tokens=motion_tokens)
+                logits, pred_log_T, _ = self.model(
+                    text_tokens,
+                    motion_tokens=motion_tokens,
+                    lengths=lengths,          # passed through to backbone batch dict
+                )
                 loss_cfg = dict(self.config)
                 loss_cfg["pred_log_T"] = pred_log_T
                 loss_cfg["true_T"] = true_T
@@ -133,14 +141,17 @@ class Trainer:
 
             loss.backward()
 
-            if ((step + 1) % accum_steps) == 0:
-                clip_grad_norm_(self.model.parameters_to_train(), max_norm=clip_norm)  # type: ignore[arg-type]
+            is_accum_step = ((step + 1) % accum_steps) == 0
+            is_last_step = (step + 1) == len(self.train_loader)
+
+            if is_accum_step or is_last_step:
+                clip_grad_norm_(self.model.parameters_to_train(), max_norm=clip_norm)
                 self.optimizer.step()
                 self.scheduler.step()
                 self.optimizer.zero_grad(set_to_none=True)
                 self._global_step += 1
 
-            total_loss += float(loss.detach().cpu()) * float(accum_steps)
+            total_loss += float(loss.detach()) * float(accum_steps)
             n_steps += 1
 
         return {"loss": total_loss / max(1, n_steps)}
