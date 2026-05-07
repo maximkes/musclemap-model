@@ -22,39 +22,31 @@ def _freeze_module(m: nn.Module) -> None:
     for p in m.parameters():
         p.requires_grad = False
 
-
 def _try_register_hidden_hooks(backbone: nn.Module, on_encoder: Any, on_decoder: Any) -> None:
-    """Best-effort hook registration against likely MotionGPT/T5 structures."""
+    """Register hooks on the actual T5 encoder/decoder inside MotionGPT."""
 
-    # NOTE: vendor API may vary; this is a heuristic and not exercised in unit tests.
-    try_candidates: list[tuple[str, nn.Module]] = []
+    t5 = None
 
-    if hasattr(backbone, "t5"):
+    # Primary path: backbone.lm.language_model (MotionGPT vendor structure)
+    lm = getattr(backbone, "lm", None)
+    if lm is not None:
+        language_model = getattr(lm, "language_model", None)
+        if language_model is not None:
+            t5 = language_model
+
+    # Fallback: backbone.t5 (alternative layout)
+    if t5 is None and hasattr(backbone, "t5"):
         t5 = getattr(backbone, "t5")
-        if hasattr(t5, "encoder") and isinstance(t5.encoder, nn.Module):
-            try_candidates.append(("encoder", t5.encoder))
-        if hasattr(t5, "decoder") and isinstance(t5.decoder, nn.Module):
-            try_candidates.append(("decoder", t5.decoder))
-            if hasattr(t5.decoder, "block") and isinstance(t5.decoder.block, (list, nn.ModuleList)) and t5.decoder.block:
-                last = t5.decoder.block[-1]
-                if isinstance(last, nn.Module):
-                    try_candidates.append(("decoder_last_block", last))
 
-    if hasattr(backbone, "encoder") and isinstance(getattr(backbone, "encoder"), nn.Module):
-        try_candidates.append(("encoder_attr", getattr(backbone, "encoder")))
-    if hasattr(backbone, "decoder") and isinstance(getattr(backbone, "decoder"), nn.Module):
-        try_candidates.append(("decoder_attr", getattr(backbone, "decoder")))
+    # Fallback: backbone itself might be a T5
+    if t5 is None:
+        t5 = backbone
 
-    registered = set()
-    for name, mod in try_candidates:
-        if name in registered:
-            continue
-        if "encoder" in name:
-            mod.register_forward_hook(lambda _m, _inp, out: on_encoder(out))
-        if "decoder" in name:
-            mod.register_forward_hook(lambda _m, _inp, out: on_decoder(out))
-        registered.add(name)
+    if hasattr(t5, "encoder") and isinstance(t5.encoder, nn.Module):
+        t5.encoder.register_forward_hook(lambda _m, _inp, out: on_encoder(out))
 
+    if hasattr(t5, "decoder") and isinstance(t5.decoder, nn.Module):
+        t5.decoder.register_forward_hook(lambda _m, _inp, out: on_decoder(out))
 
 def load_motiongpt(config: dict[str, Any]) -> nn.Module:
     """Load the frozen MotionGPT backbone from vendor/MotionGPT/.
