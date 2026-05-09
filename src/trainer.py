@@ -5,6 +5,7 @@ import logging
 import os
 from pathlib import Path
 from typing import Any
+import inspect
 
 from contextlib import nullcontext
 import torch
@@ -73,8 +74,22 @@ class Trainer:
     device: torch.device | None = None
 
     def __post_init__(self) -> None:
-        self.device = self.device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if self.device is None:
+            if torch.cuda.is_available():
+                self.device = torch.device("cuda")
+            elif getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():  # type: ignore[attr-defined]
+                self.device = torch.device("mps")
+            else:
+                self.device = torch.device("cpu")
         self.model.to(self.device)
+
+        try:
+            sig = inspect.signature(self.model.forward)
+            self._model_accepts_lengths = "lengths" in sig.parameters
+            self._model_accepts_T_frame = "T_frame" in sig.parameters
+        except (TypeError, ValueError):
+            self._model_accepts_lengths = False
+            self._model_accepts_T_frame = False
 
         # DDP wraps activation_head only (if distributed initialized).
         self.activation_head = getattr(self.model, "activation_head", None)
@@ -128,11 +143,19 @@ class Trainer:
             lengths = batch.get("lengths", true_T.tolist() if true_T.ndim > 0 else [acts.shape[1]] * acts.shape[0])
 
             with _autocast_ctx(self.device.type, enabled=use_autocast):
-                logits, pred_log_T, _ = self.model(
-                    text_tokens,
-                    motion_tokens=motion_tokens,
-                    lengths=lengths,          # passed through to backbone batch dict
-                )
+                if self._model_accepts_lengths:
+                    kwargs: dict[str, Any] = {
+                        "motion_tokens": motion_tokens,
+                        "lengths": lengths,  # passed through to backbone batch dict
+                    }
+                    if self._model_accepts_T_frame:
+                        kwargs["T_frame"] = int(acts.shape[1])
+                    logits, pred_log_T, _ = self.model(text_tokens, **kwargs)
+                else:
+                    kwargs = {"motion_tokens": motion_tokens}
+                    if self._model_accepts_T_frame:
+                        kwargs["T_frame"] = int(acts.shape[1])
+                    logits, pred_log_T, _ = self.model(text_tokens, **kwargs)
                 loss_cfg = dict(self.config)
                 loss_cfg["pred_log_T"] = pred_log_T
                 loss_cfg["true_T"] = true_T
@@ -171,8 +194,17 @@ class Trainer:
                 true_T = torch.as_tensor(batch["true_T"], device=self.device)
                 text_tokens = batch.get("text_tokens", batch["text"])
                 motion_tokens = batch.get("motion_tokens", None)
-
-                logits, pred_log_T, _ = self.model(text_tokens, motion_tokens=motion_tokens)
+                lengths = batch.get("lengths", true_T.tolist() if true_T.ndim > 0 else [acts.shape[1]] * acts.shape[0])
+                if self._model_accepts_lengths:
+                    kwargs = {"motion_tokens": motion_tokens, "lengths": lengths}
+                    if self._model_accepts_T_frame:
+                        kwargs["T_frame"] = int(acts.shape[1])
+                    logits, pred_log_T, _ = self.model(text_tokens, **kwargs)
+                else:
+                    kwargs = {"motion_tokens": motion_tokens}
+                    if self._model_accepts_T_frame:
+                        kwargs["T_frame"] = int(acts.shape[1])
+                    logits, pred_log_T, _ = self.model(text_tokens, **kwargs)
                 loss_cfg = dict(self.config)
                 loss_cfg["pred_log_T"] = pred_log_T
                 loss_cfg["true_T"] = true_T
@@ -215,9 +247,26 @@ class Trainer:
             return 0
         latest = ckpts[-1]
         state = torch.load(latest, map_location="cpu")
-        self.model.load_state_dict(state["model"])
-        self.optimizer.load_state_dict(state["optimizer"])
-        self.scheduler.load_state_dict(state["scheduler"])
+        try:
+            self.model.load_state_dict(state["model"])
+        except RuntimeError as e:
+            # Checkpoints may be incompatible across MotionGPT/vendor changes (e.g. metrics modules).
+            # Fall back to non-strict loading so training can resume from matching weights.
+            logger.warning("Non-strict checkpoint load for %s due to: %s", latest, e)
+            self.model.load_state_dict(state["model"], strict=False)
+        try:
+            self.optimizer.load_state_dict(state["optimizer"])
+        except ValueError as e:
+            # Saved after LoRA / different trainable set / config — param groups no longer match.
+            logger.warning(
+                "Skipping optimizer state from %s (incompatible param groups); continuing with a fresh optimizer: %s",
+                latest,
+                e,
+            )
+        try:
+            self.scheduler.load_state_dict(state["scheduler"])
+        except (ValueError, KeyError) as e:
+            logger.warning("Skipping scheduler state from %s: %s", latest, e)
         return int(state.get("epoch", 0)) + 1
 
     def maybe_transition_stage2(self, epoch: int) -> bool:
@@ -228,7 +277,12 @@ class Trainer:
             return False
 
         self.save_checkpoint(epoch=epoch, val_loss=float("nan"))
-        self.model.apply_lora(self.config)  # type: ignore[attr-defined]
+        try:
+            self.model.apply_lora(self.config)  # type: ignore[attr-defined]
+        except RuntimeError as e:
+            # Stage-2 depends on optional `peft`. Allow stage-1-only runs.
+            logger.warning("Skipping stage2 (LoRA) transition: %s", e)
+            return False
 
         lora_lr = float(self.config["training"].get("lora_lr", 5e-6))
         lora_params: list[nn.Parameter] = []
@@ -244,6 +298,29 @@ class Trainer:
 
         start_epoch = self.load_checkpoint()
         epochs = int(self.config["training"]["epochs"])
+
+        if _is_rank0():
+            n_val = len(self.val_loader) if self.val_loader is not None else 0
+            logger.info(
+                "Training: epochs=%d start_epoch=%d train_batches=%d val_batches=%d device=%s",
+                epochs,
+                start_epoch,
+                len(self.train_loader),
+                n_val,
+                self.device,
+            )
+
+        if start_epoch >= epochs:
+            if _is_rank0():
+                logger.warning(
+                    "No epochs to run: start_epoch=%d >= training.epochs=%d. "
+                    "The resumed checkpoint is already at or past the configured epoch limit. "
+                    "Increase `training.epochs` in the config, or remove/rename `logging.checkpoint_dir` "
+                    "to start training from scratch.",
+                    start_epoch,
+                    epochs,
+                )
+            return
 
         for epoch in range(start_epoch, epochs):
             self.maybe_transition_stage2(epoch)

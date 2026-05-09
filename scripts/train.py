@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 import types
@@ -55,7 +56,30 @@ def _maybe_init_distributed() -> None:
             torch.cuda.set_device(local_rank)
 
 
+def _configure_logging() -> None:
+    """Enable INFO logs for training; honor LOGLEVEL (default INFO)."""
+
+    level_name = os.environ.get("LOGLEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+            stream=sys.stderr,
+        )
+    else:
+        root.setLevel(level)
+    # Reduce Transformers chatter; embedding resize notes stay at INFO on their logger.
+    logging.getLogger("transformers").setLevel(logging.WARNING)
+    logging.getLogger("transformers.tokenization_utils_base").setLevel(logging.WARNING)
+
+
 def main() -> None:
+    _configure_logging()
+    log = logging.getLogger(__name__)
+
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     args = parser.parse_args()
@@ -64,6 +88,19 @@ def main() -> None:
     _maybe_init_distributed()
 
     train_dl, val_dl, _test_dl = build_dataloaders(config)
+    log.info(
+        "Dataloaders: train_samples=%d train_batches=%d val_samples=%d val_batches=%d",
+        len(train_dl.dataset),
+        len(train_dl),
+        len(val_dl.dataset),
+        len(val_dl),
+    )
+    if len(train_dl) == 0:
+        raise RuntimeError(
+            "Train DataLoader has zero batches. Increase data under data.dataset_root, "
+            "lower training.batch_size, or fix splits so the train split is non-empty."
+        )
+
     backbone = load_motiongpt(config)
     model = MuscleMAPModel(backbone=backbone, config=config)
 

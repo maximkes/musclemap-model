@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
 import torch
 from torch import nn
+from torch.optim import AdamW
 from torch.utils.data import DataLoader, Dataset
 
 from src.trainer import Trainer
@@ -118,4 +120,64 @@ def test_stage2_transition_adds_lora_params_to_optimizer(tmp_path: Path) -> None
     assert transitioned is True
     assert any("lora" in n for n, _p in model.named_parameters())
     assert any(abs(pg.get("lr", 0.0) - cfg["training"]["lora_lr"]) < 1e-12 for pg in trainer.optimizer.param_groups)
+
+
+def test_load_checkpoint_skips_incompatible_optimizer(tmp_path: Path) -> None:
+    """Resume weights even when saved optimizer param_groups do not match (e.g. LoRA vs stage1)."""
+
+    ds = TinyDataset()
+    dl = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=_collate)
+    model = DummyTrainModel()
+    cfg = _base_config(tmp_path / "ckpt")
+    trainer = Trainer(config=cfg, model=model, train_loader=dl, val_loader=dl, device=torch.device("cpu"))
+    trainer.train_epoch()
+    expected_w = float(model.w.detach().cpu())
+    trainer.save_checkpoint(epoch=0, val_loss=0.1)
+
+    ckpt_dir = Path(cfg["logging"]["checkpoint_dir"])
+    latest = sorted(ckpt_dir.glob("epoch_*.pt"))[-1]
+    blob = torch.load(latest, map_location="cpu")
+    decoy = nn.Linear(2, 2)
+    extra = nn.Parameter(torch.zeros(1))
+    opt_two_groups = AdamW(
+        [{"params": decoy.parameters(), "lr": 1e-3}, {"params": [extra], "lr": 5e-6}],
+    )
+    blob["optimizer"] = opt_two_groups.state_dict()
+    torch.save(blob, latest)
+
+    model2 = DummyTrainModel()
+    with torch.no_grad():
+        model2.w.fill_(99.0)
+    trainer2 = Trainer(config=cfg, model=model2, train_loader=dl, val_loader=dl, device=torch.device("cpu"))
+    start = trainer2.load_checkpoint()
+    assert start == 1
+    assert abs(float(model2.w.detach().cpu()) - expected_w) < 1e-5
+
+
+def test_fit_skips_loop_when_checkpoint_epoch_reaches_training_epochs(tmp_path: Path, caplog: Any) -> None:
+    """Resuming from the last saved epoch with training.epochs equal to that run yields no steps."""
+
+    ds = TinyDataset()
+    dl = DataLoader(ds, batch_size=2, shuffle=False, collate_fn=_collate)
+    model = DummyTrainModel()
+    cfg = _base_config(tmp_path / "ckpt")
+    cfg["training"]["epochs"] = 5
+    trainer0 = Trainer(config=cfg, model=model, train_loader=dl, val_loader=dl, device=torch.device("cpu"))
+    ckpt_path = tmp_path / "ckpt" / "epoch_0004.pt"
+    ckpt_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "epoch": 4,
+            "model": model.state_dict(),
+            "optimizer": trainer0.optimizer.state_dict(),
+            "scheduler": trainer0.scheduler.state_dict(),
+        },
+        ckpt_path,
+    )
+
+    model2 = DummyTrainModel()
+    trainer1 = Trainer(config=cfg, model=model2, train_loader=dl, val_loader=dl, device=torch.device("cpu"))
+    with caplog.at_level(logging.WARNING, logger="src.trainer"):
+        trainer1.fit()
+    assert "No epochs to run" in caplog.text
 

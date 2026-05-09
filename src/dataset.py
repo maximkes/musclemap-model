@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import platform
 import random
 import re
 from pathlib import Path
@@ -10,8 +11,11 @@ from typing import Any
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
+from torch.utils.data.distributed import DistributedSampler
 
 logger = logging.getLogger(__name__)
+
+_MAX_BAD_SAMPLE_RETRIES = 8
 
 
 def clean_label(sample_id: str) -> str:
@@ -92,7 +96,11 @@ class MuscleActivationDataset(Dataset[dict[str, Any]]):
         # (seq_dir, T, canonical)
         for seq_dir in seq_dirs:
             sample_id = seq_dir.name
-            acts_np = np.load(seq_dir / "activations.npy")
+            try:
+                acts_np = np.load(seq_dir / "activations.npy")
+            except (EOFError, ValueError, OSError, TimeoutError) as e:
+                logger.warning("Skipping sequence with unreadable activations.npy at %s (%s).", seq_dir, e)
+                continue
             if acts_np.ndim != 2:
                 raise ValueError(f"activations.npy must be 2D, got {acts_np.shape} in {seq_dir}")
             T = int(acts_np.shape[0])
@@ -160,9 +168,22 @@ class MuscleActivationDataset(Dataset[dict[str, Any]]):
         return len(self._items)
 
     def __getitem__(self, idx: int) -> dict[str, Any]:
-        seq_dir, start, true_T, text = self._items[idx]
-        acts_np = np.load(seq_dir / "activations.npy")
-        motion_np = np.load(seq_dir / "smplx_322.npy")
+        # Some datasets may contain partially-written / truncated .npy files.
+        # For training robustness, we retry with a different random index.
+        last_err: Exception | None = None
+        for _attempt in range(_MAX_BAD_SAMPLE_RETRIES):
+            seq_dir, start, true_T, text = self._items[idx]
+            try:
+                acts_np = np.load(seq_dir / "activations.npy")
+                motion_np = np.load(seq_dir / "smplx_322.npy")
+            except (EOFError, ValueError, OSError, TimeoutError) as e:
+                last_err = e
+                logger.warning("Skipping bad sample at %s (%s).", seq_dir, e)
+                idx = random.randrange(len(self._items))
+                continue
+            break
+        else:
+            raise RuntimeError("Too many bad samples encountered while loading dataset") from last_err
 
         if acts_np.shape[1] != self.n_muscles:
             raise ValueError(f"Expected {self.n_muscles} muscles, got {acts_np.shape[1]} in {seq_dir}")
@@ -203,17 +224,35 @@ def build_dataloaders(
     num_workers = int(config["hardware"].get("num_workers", 0))
     pin_memory = bool(config["hardware"].get("pin_memory", False))
 
+    # macOS + torchrun + DataLoader workers is a frequent source of hangs.
+    # Also, pin_memory provides no benefit without CUDA (and can warn on MPS).
+    if platform.system().lower() == "darwin" or (not torch.cuda.is_available()):
+        num_workers = 0
+        pin_memory = False
+
     train_ds = MuscleActivationDataset(dataset_root, config=config, split="train")
     val_ds = MuscleActivationDataset(dataset_root, config=config, split="val")
     test_ds = MuscleActivationDataset(dataset_root, config=config, split="test")
 
+    is_distributed = (
+        torch.distributed.is_available()
+        and torch.distributed.is_initialized()
+        and torch.distributed.get_world_size() > 1
+    )
+    train_sampler = DistributedSampler(train_ds, shuffle=True) if is_distributed else None
+    eval_sampler_val = DistributedSampler(val_ds, shuffle=False) if is_distributed else None
+    eval_sampler_test = DistributedSampler(test_ds, shuffle=False) if is_distributed else None
+
+    # drop_last=False so the last incomplete batch is kept; otherwise when
+    # len(train_ds) < batch_size the train loader is empty and no optimization runs.
     train_dl = DataLoader(
         train_ds,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=pin_memory,
-        drop_last=True,
+        drop_last=False,
     )
     eval_kwargs = {
         "batch_size": batch_size,
@@ -222,7 +261,7 @@ def build_dataloaders(
         "pin_memory": pin_memory,
         "drop_last": False,
     }
-    val_dl = DataLoader(val_ds, **eval_kwargs)
-    test_dl = DataLoader(test_ds, **eval_kwargs)
+    val_dl = DataLoader(val_ds, sampler=eval_sampler_val, **eval_kwargs)
+    test_dl = DataLoader(test_ds, sampler=eval_sampler_test, **eval_kwargs)
     return train_dl, val_dl, test_dl
 

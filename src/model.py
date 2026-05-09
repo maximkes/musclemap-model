@@ -23,30 +23,41 @@ def _freeze_module(m: nn.Module) -> None:
         p.requires_grad = False
 
 def _try_register_hidden_hooks(backbone: nn.Module, on_encoder: Any, on_decoder: Any) -> None:
-    """Register hooks on the actual T5 encoder/decoder inside MotionGPT."""
+    """Hook T5 encoder/decoder hidden states. Path: backbone.lm.language_model.{encoder,decoder}"""
+    registered_encoder = False
+    registered_decoder = False
 
-    t5 = None
-
-    # Primary path: backbone.lm.language_model (MotionGPT vendor structure)
+    # Primary: known path from backbone tree inspection
     lm = getattr(backbone, "lm", None)
     if lm is not None:
         language_model = getattr(lm, "language_model", None)
         if language_model is not None:
-            t5 = language_model
+            enc = getattr(language_model, "encoder", None)
+            dec = getattr(language_model, "decoder", None)
+            if enc is not None and isinstance(enc, nn.Module):
+                enc.register_forward_hook(lambda _m, _inp, out: on_encoder(out))
+                registered_encoder = True
+            if dec is not None and isinstance(dec, nn.Module):
+                dec.register_forward_hook(lambda _m, _inp, out: on_decoder(out))
+                registered_decoder = True
 
-    # Fallback: backbone.t5 (alternative layout)
-    if t5 is None and hasattr(backbone, "t5"):
-        t5 = getattr(backbone, "t5")
+    # Fallback: walk all T5Stack modules
+    if not registered_encoder or not registered_decoder:
+        for name, mod in backbone.named_modules():
+            if type(mod).__name__ != "T5Stack":
+                continue
+            is_decoder = getattr(getattr(mod, "config", None), "is_decoder", None)
+            if is_decoder is False and not registered_encoder:
+                mod.register_forward_hook(lambda _m, _inp, out: on_encoder(out))
+                registered_encoder = True
+            elif is_decoder is True and not registered_decoder:
+                mod.register_forward_hook(lambda _m, _inp, out: on_decoder(out))
+                registered_decoder = True
+            if registered_encoder and registered_decoder:
+                break
 
-    # Fallback: backbone itself might be a T5
-    if t5 is None:
-        t5 = backbone
-
-    if hasattr(t5, "encoder") and isinstance(t5.encoder, nn.Module):
-        t5.encoder.register_forward_hook(lambda _m, _inp, out: on_encoder(out))
-
-    if hasattr(t5, "decoder") and isinstance(t5.decoder, nn.Module):
-        t5.decoder.register_forward_hook(lambda _m, _inp, out: on_decoder(out))
+    if not registered_encoder or not registered_decoder:
+        logger.warning("Hidden state hooks NOT registered (enc=%s, dec=%s)", registered_encoder, registered_decoder)
 
 def load_motiongpt(config: dict[str, Any]) -> nn.Module:
     """Load the frozen MotionGPT backbone from vendor/MotionGPT/.
@@ -153,27 +164,58 @@ def load_motiongpt(config: dict[str, Any]) -> nn.Module:
     cfg.TRAIN.PRETRAINED_VAE = str(ckpt_path)
 
     # Inject DATASET.HUMANML3D sub-config that HumanML3DDataModule.__init__ requires.
-    # We only use MotionGPT as a backbone (no actual data loading), so all paths are
-    # set to the checkpoint directory which is guaranteed to exist.
+    # We only use MotionGPT as a backbone (no actual data loading), but the datamodule
+    # still expects the *normalization stats* under deps/t2m/.../meta/{mean,std}.npy.
+    _deps_root = vendor_root / "deps"
+    # After `prepare/download_t2m_evaluators.sh`, stats live under:
+    #   deps/t2m/t2m/t2m/<checkpoint>/meta/{mean,std}.npy
+    # MotionGPT constructs:
+    #   MEAN_STD_PATH / t2m / <checkpoint> / meta / mean.npy
+    # so MEAN_STD_PATH must be deps/t2m/t2m.
+    _mean_std_root = _deps_root / "t2m" / "t2m"
     _dummy_data_root = str(ckpt_path.parent)
     humanml3d_patch = OmegaConf.create({
         "DEBUG": False,
         "DATASET": {
             "HUMANML3D": {
                 "ROOT": _dummy_data_root,
-                "MEAN_STD_PATH": _dummy_data_root,
+                "MEAN_STD_PATH": str(_mean_std_root),
                 "MAX_MOTION_LEN": 196,
                 "MIN_MOTION_LEN": 40,
                 "MAX_TEXT_LEN": 20,
                 "UNIT_LEN": 4,
                 "STD_TEXT": False,
             },
-            "WORD_VERTILIZER_PATH": _dummy_data_root,
-            "TASK_PATH": _dummy_data_root,
+            "WORD_VERTILIZER_PATH": str(_deps_root / "glove"),
+            "TASK_PATH": str(vendor_root / "prepare" / "instructions"),
             "CODE_PATH": "TOKENS",
         }
     })
     cfg = OmegaConf.merge(cfg, humanml3d_patch)
+
+    # MotionGPT metrics expect TM2T checkpoints under:
+    #   cfg.METRIC.TM2T.t2m_path / "t2m" / "text_mot_match/model/finest.tar"
+    # With `prepare/download_t2m_evaluators.sh`, that resolves correctly when
+    # t2m_path is set to deps/t2m/t2m.
+    metric_patch = OmegaConf.create({
+        "METRIC": {"TM2T": {"t2m_path": str(_mean_std_root)}},
+    })
+    cfg = OmegaConf.merge(cfg, metric_patch)
+
+    # MotionGPT imports spaCy unconditionally in some dataset modules. We do not use
+    # those datasets, so provide a lightweight stub if spaCy is not installed.
+    try:
+        import spacy as _spacy  # noqa: F401
+    except ModuleNotFoundError:
+        import types
+
+        _spacy_stub = types.ModuleType("spacy")
+
+        def _spacy_load(_name: str):  # noqa: ANN001
+            return object()
+
+        _spacy_stub.load = _spacy_load  # type: ignore[attr-defined]
+        sys.modules["spacy"] = _spacy_stub
 
     # Monkey-patch get_sample_set so HumanML3DDataModule.__init__ never
     # tries to read actual motion/text files from disk. We only need the
@@ -193,6 +235,24 @@ def load_motiongpt(config: dict[str, Any]) -> nn.Module:
     except Exception:  # noqa: BLE001
         pass
 
+    # Monkey-patch WordVectorizer to avoid requiring GloVe assets in deps/glove/.
+    # We don't need word vectors since we never use the datamodule for training/eval.
+    try:
+        import mGPT.data.HumanML3D as _H3D  # type: ignore[import-not-found]
+
+        class _StubWordVectorizer:  # noqa: D401
+            """Minimal stub for MotionGPT datamodule init."""
+
+            def __init__(self, meta_root: str, prefix: str):  # noqa: ANN001
+                self.word2vec = {"unk": 0.0}
+
+            def __len__(self) -> int:
+                return 1
+
+        _H3D.WordVectorizer = _StubWordVectorizer  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001
+        pass
+
     # Device selection (MotionGPT supports cpu/gpu/mps).
     if torch.cuda.is_available():
         cfg.ACCELERATOR = "gpu"
@@ -207,8 +267,38 @@ def load_motiongpt(config: dict[str, Any]) -> nn.Module:
     datamodule = build_data(cfg, phase="test")
     backbone = build_model(cfg, datamodule)
 
+    def _format_module_tree(module: nn.Module, prefix: str = "", max_depth: int = 4, depth: int = 0) -> list[str]:
+        if depth > max_depth:
+            return []
+        lines: list[str] = []
+        for name, child in module.named_children():
+            lines.append(f"{prefix}{name}: {type(child).__name__}")
+            lines.extend(_format_module_tree(child, prefix + "  ", max_depth, depth + 1))
+        return lines
+
+    logger.info("=== BACKBONE TREE ===\n%s\n=== END BACKBONE TREE ===", "\n".join(_format_module_tree(backbone)))
+
     # Load weights (state_dict stored under "state_dict" in their checkpoints).
-    state = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    try:
+        state = torch.load(str(ckpt_path), map_location="cpu", weights_only=False)
+    except TimeoutError as e:
+        raise RuntimeError(
+            "Timed out while reading the MotionGPT checkpoint file. "
+            f"The file at {ckpt_path} exists but could not be read reliably. "
+            "This commonly happens when the checkpoint lives on a cloud-synced folder "
+            "(OneDrive/iCloud/Dropbox) and is still 'online-only' or otherwise stalled. "
+            "Fix: ensure the checkpoint is fully downloaded ('Always Keep on This Device') "
+            "or copy it to a local (non-synced) path and point `config.model.motiongpt_ckpt` "
+            "to that local directory."
+        ) from e
+    except (EOFError, RuntimeError, OSError) as e:
+        raise RuntimeError(
+            "Failed to load MotionGPT checkpoint. "
+            f"The file at {ckpt_path} appears corrupted or truncated. "
+            "Re-download/re-copy the MotionGPT checkpoint tar into "
+            "`vendor/MotionGPT/checkpoints/MotionGPT-base/` (or update "
+            "`config.model.motiongpt_ckpt` to point at a valid checkpoint)."
+        ) from e
     state_dict = state["state_dict"] if isinstance(state, dict) and "state_dict" in state else state
     # MotionGPT overrides `load_state_dict` and may expect evaluator/metrics to exist.
     # We only need backbone weights, so bypass custom logic.
@@ -250,14 +340,32 @@ class MuscleMAPModel(nn.Module):
     def _cache_encoder_hidden(self, out: Any) -> None:
         if isinstance(out, Tensor):
             self._cached_encoder_hidden = out
-        elif isinstance(out, (tuple, list)) and out and isinstance(out[0], Tensor):
+            return
+        if isinstance(out, (tuple, list)) and out and isinstance(out[0], Tensor):
             self._cached_encoder_hidden = out[0]
+            return
+        if isinstance(out, dict) and isinstance(out.get("last_hidden_state", None), Tensor):
+            self._cached_encoder_hidden = out["last_hidden_state"]
+            return
+        lhs = getattr(out, "last_hidden_state", None)
+        if isinstance(lhs, Tensor):
+            self._cached_encoder_hidden = lhs
+            return
 
     def _cache_decoder_hidden(self, out: Any) -> None:
         if isinstance(out, Tensor):
             self._cached_decoder_hidden = out
-        elif isinstance(out, (tuple, list)) and out and isinstance(out[0], Tensor):
+            return
+        if isinstance(out, (tuple, list)) and out and isinstance(out[0], Tensor):
             self._cached_decoder_hidden = out[0]
+            return
+        if isinstance(out, dict) and isinstance(out.get("last_hidden_state", None), Tensor):
+            self._cached_decoder_hidden = out["last_hidden_state"]
+            return
+        lhs = getattr(out, "last_hidden_state", None)
+        if isinstance(lhs, Tensor):
+            self._cached_decoder_hidden = lhs
+            return
     def _maybe_svd_warm_start(self) -> None:
         if self._svd_done:
             return
@@ -310,6 +418,8 @@ class MuscleMAPModel(nn.Module):
         text_tokens: Any,
         motion_tokens: Any | None = None,
         lengths: list[int] | None = None,
+        *,
+        T_frame: int | None = None,
     ) -> tuple[Tensor, Tensor, Any]:
 
         self._maybe_svd_warm_start()
@@ -326,19 +436,56 @@ class MuscleMAPModel(nn.Module):
         if lengths is None:
             lengths = [196] * B  # HumanML3D max as safe fallback
 
-        if motion_tokens is None:
-            batch = {"text": text_tokens, "length": lengths}
-            motion_output = (
-                self.backbone.generate(batch)
-                if hasattr(self.backbone, "generate")
-                else self.backbone(batch)
-            )
-        else:
-            motion_output = self.backbone(
-                {"text": text_tokens, "motion_tokens": motion_tokens, "length": lengths}
-            )
+        # Always use teacher-forcing forward() — never generate() during training.
+        # generate() is autoregressive and incompatible with DDP synchronization.
+        batch = {"text": text_tokens, "length": lengths}
+        if motion_tokens is not None:
+            batch["motion_tokens"] = motion_tokens
+        motion_output = self.backbone(batch)
+
         encoder_hidden = self._cached_encoder_hidden
         decoder_hidden = self._cached_decoder_hidden
+
+        # If the MotionGPT wrapper uses autoregressive generation (and thus never
+        # calls T5 encoder/decoder forward), fall back to a direct teacher-forced
+        # pass through the underlying HF T5 model to obtain hidden states.
+        if encoder_hidden is None or decoder_hidden is None:
+            lm = getattr(self.backbone, "lm", None)
+            language_model = getattr(lm, "language_model", None) if lm is not None else None
+            tokenizer = getattr(lm, "tokenizer", None) if lm is not None else None
+            if language_model is not None and tokenizer is not None and isinstance(text_tokens, list):
+                device = next(self.activation_head.parameters()).device
+                enc = tokenizer(
+                    text_tokens,
+                    padding="max_length",
+                    max_length=int(getattr(lm, "max_length", 256)),
+                    truncation=True,
+                    return_attention_mask=True,
+                    add_special_tokens=True,
+                    return_tensors="pt",
+                )
+                input_ids = enc["input_ids"].to(device)
+                attention_mask = enc["attention_mask"].to(device)
+                start_id = int(
+                    getattr(getattr(language_model, "config", None), "decoder_start_token_id", None)
+                    or getattr(getattr(language_model, "config", None), "pad_token_id", 0)
+                )
+                decoder_input_ids = torch.full(
+                    (input_ids.shape[0], 1),
+                    fill_value=start_id,
+                    device=device,
+                    dtype=input_ids.dtype,
+                )
+                out = language_model(
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    decoder_input_ids=decoder_input_ids,
+                    output_hidden_states=True,
+                    return_dict=True,
+                    use_cache=False,
+                )
+                encoder_hidden = getattr(out, "encoder_last_hidden_state", None)
+                decoder_hidden = getattr(out, "decoder_last_hidden_state", None)
 
         # Allow mocked backbones to return hidden states directly.
         if encoder_hidden is None and isinstance(motion_output, dict) and "encoder_hidden" in motion_output:
@@ -352,24 +499,27 @@ class MuscleMAPModel(nn.Module):
         pred_log_T = self.length_predictor(encoder_hidden)  # [B, 1]
 
         # Pick one common T_frame for the whole batch.
-        if self.config is not None:
-            lp_cfg = self.config.get("model", {}).get("length_predictor", {})
-            min_T = int(lp_cfg.get("min_T", 30))
-            max_T = int(lp_cfg.get("max_T", 256))
-        else:
-            min_T, max_T = 30, 256
-        pred_T = torch.exp(pred_log_T).round().clamp(min=float(min_T), max=float(max_T)).to(dtype=torch.int64)
-        T_frame = int(pred_T.max().item())
+        # During training we usually override this to match the padded target length.
+        if T_frame is None:
+            if self.config is not None:
+                lp_cfg = self.config.get("model", {}).get("length_predictor", {})
+                min_T = int(lp_cfg.get("min_T", 30))
+                max_T = int(lp_cfg.get("max_T", 256))
+            else:
+                min_T, max_T = 30, 256
+            pred_T = torch.exp(pred_log_T).round().clamp(min=float(min_T), max=float(max_T)).to(dtype=torch.int64)
+            T_frame = int(pred_T.max().item())
 
         logits = self.activation_head(decoder_hidden, T_frame=T_frame)  # [B, T_frame, 80]
         return logits, pred_log_T, motion_output
 
     def parameters_to_train(self):
-        """Return only the trainable parameters (activation_head + LoRA adapters).
-        Backbone weights are frozen except for LoRA layers injected by peft.
+        """Return trainable parameters (activation head, length predictor, optional LoRA).
+
+        Backbone weights stay frozen except LoRA adapters injected by peft.
         """
         params = list(self.activation_head.parameters())
-        # Include any backbone params that have requires_grad=True (i.e. LoRA adapters)
+        params += list(self.length_predictor.parameters())
         params += [p for p in self.backbone.parameters() if p.requires_grad]
         return params
     

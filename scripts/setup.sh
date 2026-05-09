@@ -50,7 +50,22 @@ echo "==> Ensuring spaCy is installed (may be absent from MotionGPT requirements
 "${CONDA_PIP}" install spacy
 
 echo "==> Installing spaCy English model"
-"${CONDA_PYTHON}" -m spacy download en_core_web_sm --quiet
+# This download hits GitHub (compatibility.json) and can time out on restricted networks.
+# Make it best-effort so setup doesn't fail.
+if [[ "${SKIP_SPACY_MODEL_DOWNLOAD:-0}" == "1" ]]; then
+  echo "    SKIP_SPACY_MODEL_DOWNLOAD=1 set — skipping"
+else
+  "${CONDA_PYTHON}" - <<'PY'
+import importlib.util
+spec = importlib.util.find_spec("en_core_web_sm")
+print("    en_core_web_sm already installed — skipping" if spec is not None else "    en_core_web_sm missing — attempting download")
+PY
+  if ! "${CONDA_PYTHON}" -m spacy download en_core_web_sm --quiet; then
+    echo "    spaCy model download failed (network/timeout). Continuing."
+    echo "    You can retry later with:"
+    echo "      ${CONDA_PYTHON} -m spacy download en_core_web_sm"
+  fi
+fi
 
 echo "==> (Optional) If you see protobuf errors, pin protobuf<5"
 echo "    ${CONDA_PIP} install 'protobuf<5'"
@@ -67,12 +82,24 @@ PY
 echo ""
 echo "Next steps:"
 echo "  1. conda activate musclemap-model"
-echo "  2. Download the MotionGPT model checkpoint weights"
+echo "  2. Download MotionGPT dependencies + pretrained models"
 echo "     cd vendor/MotionGPT"
-echo "     bash prepare/download_pretrained_model.sh"
+echo "     bash prepare/download_smpl_model.sh"
+echo "     bash prepare/prepare_t5.sh"
+echo "     bash prepare/download_t2m_evaluators.sh"
+echo "     bash prepare/download_pretrained_models.sh"
 echo "     cd ../../"
-echo "     - Sanity check (should list files, not be empty):"
+echo "     - Sanity check (should exist):"
 echo "         ls vendor/MotionGPT/checkpoints/MotionGPT-base/"
-echo "     - If you keep checkpoints elsewhere, update config/train.yaml -> model.motiongpt_ckpt accordingly"
+echo "     - If you store checkpoints elsewhere, update config/train.yaml -> model.motiongpt_ckpt accordingly"
 echo "  3. Edit config/train.yaml -> data.dataset_root"
-echo "  4. torchrun --nproc_per_node=2 scripts/train.py --config config/train.yaml"
+echo "  4. IMPORTANT: run training from the musclemap-model repo root (NOT inside vendor/MotionGPT)"
+echo "     Quick check (should end with /musclemap-model):"
+echo "       pwd"
+echo "     Quick check (should point to conda env python 3.10):"
+echo "       python -c \"import sys; print(sys.executable, sys.version)\""
+echo "  5. Train:"
+echo "     - macOS (CPU/MPS):"
+echo "         python scripts/train.py --config config/train.yaml"
+echo "     - Linux + NVIDIA (2 GPUs):"
+echo "         torchrun --nproc_per_node=2 scripts/train.py --config config/train.yaml"

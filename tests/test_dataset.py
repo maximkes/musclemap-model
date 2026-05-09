@@ -7,7 +7,7 @@ from typing import Any
 import numpy as np
 import pytest
 
-from src.dataset import MuscleActivationDataset, clean_label
+from src.dataset import MuscleActivationDataset, build_dataloaders, clean_label
 
 
 def _write_seq(seq_dir: Path, *, T: int, n_muscles: int = 80, label: str) -> None:
@@ -118,6 +118,21 @@ def test_numeric_blob_label_falls_back_to_clean_label(synthetic_dataset_root: Pa
     assert jump_items, "Expected jump_* items to be present"
     for ex in jump_items:
         assert ex["text"] == clean_label("jump")
+
+
+def test_train_loader_non_empty_when_samples_fewer_than_batch(tmp_path: Path) -> None:
+    """With drop_last=False, one train sample still yields one batch (regression guard)."""
+
+    root = tmp_path / "data"
+    root.mkdir(parents=True)
+    (root / "muscle_names.json").write_text(json.dumps([f"m{i}" for i in range(80)]), encoding="utf-8")
+    _write_seq(root / "single_seq", T=40, label="walk")
+
+    config = _base_config(root, min_T=30, max_T=64)
+    config["training"]["batch_size"] = 16
+    train_dl, _, _ = build_dataloaders(config)
+    assert len(train_dl.dataset) >= 1
+    assert len(train_dl) >= 1
 
 
 def test_dataset_version_subdir_used_when_set(tmp_path: Path) -> None:

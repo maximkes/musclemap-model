@@ -48,6 +48,10 @@ def test_only_head_and_predictor_trainable_before_lora() -> None:
 
     trainable = {id(p) for p in model.parameters_to_train()}
     assert trainable
+    head_and_lp = {id(p) for p in model.activation_head.parameters()} | {
+        id(p) for p in model.length_predictor.parameters()
+    }
+    assert head_and_lp <= trainable
     for p in backbone.parameters():
         assert p.requires_grad is False
         assert id(p) not in trainable
