@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import types
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,25 @@ import torch
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+
+
+def _ensure_bert_score_stub() -> None:
+    """MotionGPT metrics import bert_score; we only need backbone weights for eval."""
+
+    if "bert_score" in sys.modules:
+        return
+    mod = types.ModuleType("bert_score")
+
+    def score(*args, **kwargs):  # noqa: ANN001
+        import torch as _torch
+
+        return _torch.tensor([0.0]), _torch.tensor([0.0]), _torch.tensor([0.0])
+
+    mod.score = score
+    sys.modules["bert_score"] = mod
+
+
+_ensure_bert_score_stub()
 
 from src.dataset import MuscleActivationDataset  # noqa: E402
 from src.metrics import compute_metrics  # noqa: E402
@@ -38,6 +58,20 @@ def _resolve_ckpt(config: dict[str, Any], ckpt_arg: str | None) -> Path:
     if not ckpts:
         raise FileNotFoundError(f"No checkpoints found in {ckpt_dir}")
     return ckpts[-1]
+
+
+def _json_safe(obj: Any) -> Any:
+    """Convert nested metrics (numpy arrays, scalars) for json.dumps."""
+
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, dict):
+        return {str(k): _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_json_safe(v) for v in obj]
+    return obj
 
 
 def _r2_table(r2: np.ndarray, muscle_names: list[str], k: int = 10) -> str:
@@ -105,7 +139,7 @@ def main() -> None:
     out_dir = Path("results")
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"{split}_metrics.json"
-    out_path.write_text(json.dumps(metrics, indent=2), encoding="utf-8")
+    out_path.write_text(json.dumps(_json_safe(metrics), indent=2), encoding="utf-8")
 
     print(f"Loaded ckpt: {ckpt_path}")
     print(f"Wrote: {out_path}")
